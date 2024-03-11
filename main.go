@@ -5,96 +5,95 @@ import "math/rand"
 import "math/bits"
 
 type Layer struct {
-	state, laststate []uint64 // 1 = reinforced, 0 = discouraged
+	inputsize int
+	outputpattern []int
 	weights [][]uint64 // 1 = reinforcing, 0 = discouraging
 	previous *Layer
 }
 
-func New(prevlayersize, statesize int) *Layer {
+type State struct {
+	State []uint64
+	Input []*State
+	Layer *Layer
+	Offset int
+}
+
+func NewLayer(inputsize int, outputpattern []int) *Layer {
 	result := new(Layer)
-	result.state = make([]uint64, statesize)
-	result.laststate = make([]uint64, statesize)
-	result.weights = make([][]uint64, 64 * statesize)
-	for i, _ := range result.weights {
-		result.weights[i] = make([]uint64, prevlayersize)
+	result.inputsize = inputsize
+	result.outputpattern = outputpattern
+	outputsize := 0
+	for _, size := range outputpattern {
+		outputsize += size
 	}
+	result.weights = make([][]uint64, 64 * outputsize)
+	for i, _ := range result.weights {
+		result.weights[i] = make([]uint64, inputsize)
+	}
+	result.RandomizeWeights()
 	return result
 }
 
-func (l *Layer) SetPrevious(p *Layer) {
-	l.previous = p
+func InputState(data []uint64) *State {
+	result := new(State)
+	result.State = data
+	result.Input = nil
+	result.Layer = nil
+	return result
 }
 
-func (l *Layer) SetState(i int, v uint64) {
-	l.state[i] = v
+func NewState(size int) *State {
+	result := new(State)
+	result.State = make([]uint64, size)
+	result.Input = nil
+	result.Layer = nil
+	return result
 }
 
-func (l *Layer) GetState(i int) uint64 {
-	return l.state[i]
-}
+func (l *Layer) Compute(input []*State) []*State {
+	result := make([]*State, len(l.outputpattern))
+	inp_offset := 0
+	for i, sz := range l.outputpattern {
+		st := new(State)
+		st.State = make([]uint64, sz)
+		st.Input = input
+		st.Layer = l
+		st.Offset = inp_offset
+		result[i] = st
+		inp_offset += sz
+	}
+	oi := 0
+	oj := 0
 
-func (l *Layer) Reinforce(idx int, val uint64, maxdepth int) {
-	l.ReinforceEx(idx, val, maxdepth, l, 0)
-}
-func (l *Layer) ReinforceEx(idx int, val uint64, maxdepth int, l2 *Layer, xdepth int) {
-	if maxdepth < 1 {
-		return
-	}
-	ps := l.previous.state
-	if l.previous == l2 {
-		xdepth++
-	}
-	if xdepth > 1 {
-		ps = l.previous.laststate
-	}
-	// iterate through all 64 bits
-	for i := 64 * idx; i < 64 * idx + 64; i++ {
-		w := l.weights[i]
-		sum := 0
-		for j := 0; j < len(ps); j++ {
-			w := ps[j] ^ w[j]
-			sum -= 32 - bits.OnesCount64(w)
-		}
-		v := uint64(int64(sum)) >> 63 // 1 or 0
-		if ((val >> (i % 64)) & 1) != v {
-			//fmt.Println("need correction in bit", maxdepth, i)
-			for j := 0; j < len(ps); j++ {
-				changemask := ps[j] ^ w[j]
-				if v == 0 {
-					// v = 0 but should be 1; it becomes one when w = 0x00
-				} else {
-					// v = 1 but should be 0; it becomes one when w = 0xFF
-					changemask = ^changemask // negate w so we know the exact bitmask where w is not good at yet
-				}
-				changemask = changemask & rand.Uint64() // do not change everything in every cycle!
-				reinforcemask := rand.Uint64() // if the mask is 1, flip the weight; if it is 0, reinforce the parent's state
-				w[j] = w[j] ^ (reinforcemask & changemask) // the bits that need to be flipped
-				betterstate := ps[j] ^ (changemask & (^reinforcemask)) // the desired state for the previous layer
-				l.previous.ReinforceEx(j, betterstate, maxdepth - 1, l2, xdepth)
-			}
-		}
-	}
-	// insert the desired state into our state so the rest of the network can learn it better
-	//l.state[idx] = val
-}
-
-func (l *Layer) Proceed() {
-	// double bufferec
-	l.state, l.laststate = l.laststate, l.state
 	m := uint64(0)
 	for i, w := range l.weights {
 		sum := 0
-		for j := 0; j < len(l.previous.state); j++ {
-			w := l.previous.state[j] ^ w[j]
+		ii := 0 // input pointer
+		ij := 0
+		for j := 0; j < l.inputsize; j++ {
+			for ij >= len(input[ii].State) {
+				// move to next input array
+				ij = 0
+				ii++
+			}
+			w := input[ii].State[ij] ^ w[j]
+			ij++
 			sum -= 32 - bits.OnesCount64(w)
 		}
 		v := uint64(int64(sum)) >> 63 // 1 or 0
 		m = m | (v << (i % 64))
 		if i % 64 == 63 {
-			l.state[i / 64] = m
+			// write a uint64
+			for oj >= len(result[oi].State) {
+				oj = 0
+				oi++
+			}
+			result[oi].State[oj] = m
 			m = 0
+			oj++
 		}
 	}
+	return result
 }
 
 func (l *Layer) RandomizeWeights() {
@@ -105,49 +104,96 @@ func (l *Layer) RandomizeWeights() {
 	}
 }
 
-func (l *Layer) Reset() {
-	for i, _ := range l.state {
-		l.state[i] = 0
-		l.laststate[i] = 0
+func (s *State) Cleanup(maxdepth int) {
+	if maxdepth <= 1 {
+		// forget previous data
+		s.Input = nil
+		s.Layer = nil
+	} else {
+		for _, in := range s.Input {
+			in.Cleanup(maxdepth - 1)
+		}
+	}
+}
+
+func (s *State) Reinforce(idx int, val uint64) {
+	if s.Input == nil {
+		return // cannot reinforce history that I forgot
+	}
+	idx += s.Offset // offset in source state
+	// iterate through all 64 bits
+	for i := 64 * idx; i < 64 * idx + 64; i++ {
+		w := s.Layer.weights[i]
+		sum := 0
+		ii := 0 // input pointer
+		ij := 0
+		for j := 0; j < s.Layer.inputsize; j++ {
+			for ij >= len(s.Input[ii].State) {
+				// move to next input array
+				ij = 0
+				ii++
+			}
+			w := s.Input[ii].State[ij] ^ w[j]
+			ij++
+			sum -= 32 - bits.OnesCount64(w)
+		}
+		v := uint64(int64(sum)) >> 63 // 1 or 0
+		if ((val >> (i % 64)) & 1) != v {
+			//fmt.Println("need correction in bit", i)
+			ii := 0 // input pointer
+			ij := 0
+			for j := 0; j < s.Layer.inputsize; j++ {
+				for ij >= len(s.Input[ii].State) {
+					// move to next input array
+					ij = 0
+					ii++
+				}
+				changemask := s.Input[ii].State[ij] ^ w[j] // changemask is a bit vector that shows a 1 wherever either weight or previous state has to change
+				if v == 0 {
+					// v = 0 but should be 1; it becomes one when w = 0x00
+				} else {
+					// v = 1 but should be 0; it becomes one when w = 0xFF
+					changemask = ^changemask // negate w so we know the exact bitmask where w is not good at yet
+				}
+				changemask = changemask & rand.Uint64() // do not change everything in every cycle!
+				if s.Input[ii].Input == nil {
+					// pure weight change since it is a hard input node
+					w[j] = w[j] ^ changemask // the bits that need to be flipped
+				} else {
+					// split the change between weight and reinforcement
+					reinforcemask := rand.Uint64() // if the mask is 1, flip the weight; if it is 0, reinforce the parent's state
+					w[j] = w[j] ^ (reinforcemask & changemask) // the bits that need to be flipped
+					betterstate := s.Input[ii].State[ij] ^ (changemask & (^reinforcemask)) // the desired state for the previous layer
+					s.Input[ii].Reinforce(ij, betterstate) // recurse over the whole network
+				}
+			}
+		}
 	}
 }
 
 func main() {
 	fmt.Println("Hello World")
-	networksize := 8
-	layers := []*Layer{New(networksize, networksize), New(networksize, networksize)}
-	layers[0].SetPrevious(layers[1])
-	layers[1].SetPrevious(layers[0])
-	layers[0].RandomizeWeights()
-	layers[1].RandomizeWeights()
+	networksize := 16
+	layer := NewLayer(networksize, []int{networksize, 1})
 
 	for it := 0; it < 10000; it++ {
 		s := "Hello I am Alex"
 		s2 := []byte{}
-		layers[0].Reset()
-		layers[1].Reset()
-		for i, c := range s {
+
+		// start with a new state
+		state := NewState(networksize)
+		for _, c := range s {
 			// at first get the networks prediction
-			layers[0].Proceed()
-			layers[1].Proceed()
+			//input := InputState([]uint64{uint64(c)})
+			//o := layer.Compute([]*State{input, state})
+			o := layer.Compute([]*State{state}) // compute ohne input
+			state = o[0] // next state
+			state.Cleanup(2)
 
 			// read out what character the network would print
-			state := layers[1].GetState(1)
-			s2 = append(s2, byte(state & 0xff))
-
-			// compare state to the result and learn
-			state = (state & uint64(^uint64(0xff))) | uint64(c)
-			layers[1].Reinforce(1, state, 2) // learn how it should work
-
-			/*
-			// then simulate the result
-			input := (uint64(c) << 24) | (uint64(c) << 16) | (uint64(c)) // character as input
-			layers[0].SetState(0, input)
-			layers[1].SetState(0, input)
-			*/
-			if i >= it/1000 {
-				break
-			}
+			outbyte := o[1].State[0]
+			s2 = append(s2, byte(outbyte & 0xff))
+			o[1].Reinforce(0, uint64(c))
 		}
 		fmt.Println(string(s2))
 	}
